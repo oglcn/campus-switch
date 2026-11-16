@@ -18,6 +18,17 @@ for f in /opt/homebrew/bin/tailscaled /opt/homebrew/bin/tailscale /usr/local/bin
   [[ -x $f ]] || { echo "Missing $f (brew install tailscale / install Cloudflare WARP)"; exit 1; }
 done
 
+if [[ ! -f config ]]; then
+  if [[ -f $BASE/config ]]; then
+    echo "==> Keeping your installed settings (copied to ./config)"
+    cp "$BASE/config" config
+  else
+    echo "==> First-time setup"
+    sudo -u "$USER_NAME" ./configure.sh
+  fi
+  chown "$USER_NAME" config
+fi
+
 echo "==> Building the menu bar app"
 sudo -u "$USER_NAME" ./build.sh
 
@@ -35,12 +46,7 @@ echo "==> Installing the service"
 mkdir -p "$RUN"
 install -o root -g wheel -m 755 daemon/campusd "$BASE/campusd"
 install -o root -g wheel -m 644 daemon/com.campusswitch.tailscaled.plist "$BASE/"
-if [[ -f config ]]; then
-  install -o root -g wheel -m 644 config "$BASE/config"
-elif [[ ! -f $BASE/config ]]; then
-  install -o root -g wheel -m 644 config.example "$BASE/config"
-  echo "    (no ./config found; installed config.example; edit $BASE/config with sudo)"
-fi
+install -o root -g wheel -m 644 config "$BASE/config"
 install -o root -g wheel -m 644 daemon/$DAEMON.plist /Library/LaunchDaemons/
 chown root:wheel "$BASE" "$RUN"; chmod 755 "$BASE" "$RUN"
 # The menu bar app (running as you) writes these two files.

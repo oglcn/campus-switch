@@ -23,11 +23,10 @@ The Tailscale Mac app deliberately sends its own traffic around other VPN tunnel
 ```bash
 git clone https://github.com/oglcn/campus-switch.git
 cd campus-switch
-cp config.example config    # then edit it, see below
 sudo ./install.sh
 ```
 
-The installer builds the menu bar app, installs the background service (starts at boot), and adds the menu bar app as a login item.
+On a first install it asks three optional questions: which tailnet machine to ping as a health check (picked from a list of your machines), your homelab domain, and your university's domain. It then builds the menu bar app, installs the background service (starts at boot), and adds the menu bar app as a login item.
 
 **Log in once:** the Homebrew `tailscaled` is a separate Tailscale device from the Mac app. The first time it runs in campus mode, log it in:
 
@@ -39,14 +38,14 @@ Then open the printed link. It shows up in your tailnet as a second machine.
 
 ## Configuration
 
-`config` (zsh syntax) is installed to `/Library/Application Support/CampusSwitch/config`:
+Your answers are saved in `config` (zsh syntax; not committed, see `config.example`) and installed to `/Library/Application Support/CampusSwitch/config`:
 
 | Setting | Meaning |
 |---|---|
 | `EXTRA_BYPASS=( … )` | Hosts that skip WARP in campus mode. Add your homelab domain so it goes over Tailscale, and your university's domain so its sites still see a campus IP. |
 | `PEER=name` | A tailnet machine the menu bar app pings every 30 s as a health check. Empty hides it. |
 
-To change it later, edit `config` and run `sudo ./install.sh` again.
+To change it later, run `./configure.sh` (or edit `config` by hand), then `sudo ./install.sh` again. The service and the menu bar app read it only when they start.
 
 ## How it works
 
