@@ -1,0 +1,262 @@
+#!/bin/zsh
+# campusd — switches this Mac between "normal" and "campus" mode.
+#
+#   normal: Tailscale Mac app as usual, no WARP, no system proxy.
+#   campus: Tailscale's servers are blocked on this network, so
+#           WARP runs as a local proxy (127.0.0.1:40000), a Homebrew
+#           tailscaled runs behind it, and the macOS web proxy points
+#           at WARP so browsers get through too.
+#
+# Runs as root under launchd (com.campusswitch.daemon). It never touches
+# the routing table, so the worst case is "no tailnet", never "no internet".
+#
+#   campusd           run the loop (what launchd does)
+#   campusd probe     print what it would decide, change nothing
+
+emulate -L zsh
+setopt no_unset pipe_fail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
+
+BASE="/Library/Application Support/CampusSwitch"
+RUN="$BASE/run"
+MODE_FILE="$RUN/mode"          # auto | campus | normal   (written by the menu bar app)
+TRIGGER_FILE="$RUN/trigger"    # touched by the menu bar app for "Check now"
+STATE_FILE="$RUN/state.json"   # read by the menu bar app
+PROXY_SVCS="$RUN/proxy_services"
+WARP_MANAGED="$RUN/warp_managed"
+LOG=/Library/Logs/CampusSwitch.log
+
+TSD_LABEL=com.campusswitch.tailscaled
+TSD_PLIST="$BASE/$TSD_LABEL.plist"
+WARP_CLI=/usr/local/bin/warp-cli
+PROXY_PORT=40000
+PROBE_URL='https://controlplane.tailscale.com/key?v=148'
+CAPTIVE_URL='http://captive.apple.com/hotspot-detect.html'
+# Hosts that skip the WARP proxy: local and tailnet addresses. Add your own
+# (homelab domain, university sites) as EXTRA_BYPASS in the config file.
+BYPASS=( '*.local' '169.254/16' '10.0.0.0/8' '172.16.0.0/12' '192.168.0.0/16' '100.64.0.0/10' '*.ts.net' )
+EXTRA_BYPASS=()
+CONFIG="$BASE/config"
+# Only trust a root-owned config, since this script runs as root.
+if [[ -f $CONFIG && $(stat -f %Su "$CONFIG") == root ]]; then source "$CONFIG"; fi
+BYPASS+=( "${EXTRA_BYPASS[@]}" )
+
+EVAL_INTERVAL=60     # seconds between routine re-checks
+CAMPUS_BACKOFF=300   # after WARP fails, wait this long before trying campus mode again
+
+# ---------------------------------------------------------------- helpers
+log() { print -r -- "$(date '+%F %T') $*" >> "$LOG" }
+warp() { "$WARP_CLI" --accept-tos "$@" 2>&1 }
+
+default_route() {  # prints "iface gateway"
+  route -n get default 2>/dev/null | awk '/interface:/{i=$2} /gateway:/{g=$2} END{print i" "g}'
+}
+service_for_iface() {  # en0 -> "Wi-Fi"
+  networksetup -listnetworkserviceorder 2>/dev/null | awk -v dev="$1" '
+    /^\([0-9*]+\) /{ name=$0; sub(/^\([0-9*]+\) /, "", name) }
+    index($0, "Device: " dev ")") { print name; exit }'
+}
+
+http_code() { curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null }
+internet_ok() { curl -s -m 5 --interface "$1" "$CAPTIVE_URL" 2>/dev/null | grep -q Success }
+direct_ok()   { [[ $(http_code -m 6 --interface "$1" "$PROBE_URL") == 200 ]] }
+proxy_ok()    { [[ $(http_code -m 8 -x "http://127.0.0.1:$PROXY_PORT" "$PROBE_URL") == 200 ]] }
+
+tsd_running() { launchctl print "system/$TSD_LABEL" >/dev/null 2>&1 }
+tsd_start()   { tsd_running || { launchctl bootstrap system "$TSD_PLIST" && log "tailscaled started"; } }
+tsd_stop()    { tsd_running && { launchctl bootout "system/$TSD_LABEL" 2>/dev/null; log "tailscaled stopped"; }; true }
+
+sysproxy_on() {
+  local svc=$1
+  [[ -n $svc ]] || return 1
+  networksetup -setsecurewebproxy "$svc" 127.0.0.1 $PROXY_PORT off
+  networksetup -setwebproxy "$svc" 127.0.0.1 $PROXY_PORT off
+  networksetup -setproxybypassdomains "$svc" "${BYPASS[@]}"
+  grep -qxF -- "$svc" "$PROXY_SVCS" 2>/dev/null || print -r -- "$svc" >> "$PROXY_SVCS"
+  log "system proxy on ($svc)"
+}
+sysproxy_off() {
+  [[ -f $PROXY_SVCS ]] || return 0
+  local svc
+  while IFS= read -r svc; do
+    [[ -n $svc ]] || continue
+    networksetup -setsecurewebproxystate "$svc" off
+    networksetup -setwebproxystate "$svc" off
+    log "system proxy off ($svc)"
+  done < "$PROXY_SVCS"
+  rm -f "$PROXY_SVCS"
+}
+
+warp_proxy_up() {
+  if ! warp settings | grep -q "Mode: WarpProxy on port $PROXY_PORT"; then
+    warp mode proxy >/dev/null
+    warp proxy port $PROXY_PORT >/dev/null
+  fi
+  touch "$WARP_MANAGED"
+  warp status | grep -q 'Status update: Connected' || warp connect >/dev/null
+  local i
+  for i in {1..10}; do proxy_ok && return 0; sleep 2; done
+  log "WARP proxy did not reach Tailscale: $(warp status | tr '\n' ' ')"
+  return 1
+}
+warp_manual() {  # WARP full tunnel connected, and not by us
+  [[ -f $WARP_MANAGED ]] && return 1
+  warp status | grep -q 'Status update: Connected' || return 1
+  warp settings | grep -q 'Mode: Warp$'
+}
+warp_release() {
+  [[ -f $WARP_MANAGED ]] || return 0
+  warp disconnect >/dev/null
+  warp mode warp >/dev/null   # leave WARP in its normal mode for manual use
+  rm -f "$WARP_MANAGED"
+  log "WARP released (disconnected, mode warp)"
+}
+
+apply_campus() {  # $1 = network service for the system proxy
+  warp_proxy_up || return 1
+  scutil --nc stop Tailscale >/dev/null 2>&1   # the Mac app's tunnel can't work here
+  tsd_start
+  # Accept subnet routes so your home LAN addresses work over the tailnet.
+  local i
+  for i in {1..10}; do
+    /opt/homebrew/bin/tailscale --socket=/var/run/tailscaled-cli.socket set --accept-routes >/dev/null 2>&1 && break
+    sleep 1
+  done
+  sysproxy_on "$1"
+  return 0
+}
+apply_normal() {
+  tsd_stop
+  sysproxy_off
+  warp_release
+}
+
+# ---------------------------------------------------------------- state
+state=unknown; since=$(date +%s); reason=""
+iface=""; gw=""; svc=""; mode=auto
+
+json_str() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; print -rn -- "\"$s\"" }
+set_state() {  # state reason
+  local new=$1; reason=$2
+  if [[ $new != $state ]]; then
+    log "state: $state -> $new ($reason)"
+    state=$new; since=$(date +%s)
+  fi
+  local tmp="$STATE_FILE.tmp"
+  {
+    print -n '{"state":';   json_str "$state"
+    print -n ',"reason":';  json_str "$reason"
+    print -n ',"mode":';    json_str "$mode"
+    print -n ',"iface":';   json_str "$iface"
+    print -n ',"gateway":'; json_str "$gw"
+    print -n ',"service":'; json_str "$svc"
+    print -n ",\"since\":$since,\"checked\":$(date +%s),\"tailscaled\":$(tsd_running && print true || print false)}"
+    print
+  } > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$STATE_FILE"
+}
+
+read_mode() {
+  local m; m=$(head -c 16 "$MODE_FILE" 2>/dev/null | tr -dc 'a-z')
+  case $m in auto|campus|normal) print $m ;; *) print auto ;; esac
+}
+
+offline_count=0; health_fail=0; campus_backoff_until=0
+
+want_normal() {  # reason
+  [[ $state == normal ]] || apply_normal
+  health_fail=0
+  set_state normal "$1"
+}
+
+want_campus() {  # reason
+  local now=$(date +%s)
+  if [[ $state == campus ]]; then
+    if proxy_ok && tsd_running; then health_fail=0; set_state campus "$1"; return; fi
+    (( health_fail++ ))
+    log "campus health check failed ($health_fail)"
+    (( health_fail < 2 )) && return
+    warp disconnect >/dev/null   # force a fresh WARP connection below
+  fi
+  if (( now < campus_backoff_until )); then
+    set_state warp_failed "WARP unavailable; retrying at $(date -r $campus_backoff_until '+%H:%M')"
+    return
+  fi
+  if apply_campus "$svc"; then
+    health_fail=0
+    set_state campus "$1"
+  else
+    apply_normal
+    campus_backoff_until=$(( now + CAMPUS_BACKOFF ))
+    set_state warp_failed "WARP could not connect; plain Wi-Fi for now, retrying at $(date -r $campus_backoff_until '+%H:%M')"
+  fi
+}
+
+evaluate() {
+  mode=$(read_mode)
+  svc=$(service_for_iface "$iface")
+  if [[ -z $iface ]]; then set_state offline "No network"; return; fi
+
+  case $mode in
+    normal) want_normal "Forced normal"; return ;;
+    campus) want_campus "Forced campus mode"; return ;;
+  esac
+
+  # You turned on WARP's full tunnel yourself: leave everything alone.
+  if warp_manual; then
+    [[ $state == campus ]] && apply_normal
+    set_state warp_manual "WARP full tunnel is on (turned on manually); not switching"
+    return
+  fi
+
+  if ! internet_ok "$iface"; then
+    (( offline_count++ ))
+    # Drop the proxy after two misses so captive-portal logins still work.
+    if (( offline_count >= 2 )) && [[ $state == campus ]]; then apply_normal; fi
+    set_state offline "No internet (or a login page) on $iface"
+    return
+  fi
+  offline_count=0
+
+  if direct_ok "$iface"; then want_normal "Tailscale reachable directly"; return; fi
+  sleep 2
+  if direct_ok "$iface"; then want_normal "Tailscale reachable directly"; return; fi
+  want_campus "Tailscale blocked on this network; using WARP"
+}
+
+# ---------------------------------------------------------------- probe
+if [[ ${1:-} == probe ]]; then
+  read iface gw <<< "$(default_route)"
+  print "interface:  ${iface:-none}  gateway: ${gw:-none}  service: $(service_for_iface "$iface")"
+  print "mode file:  $(read_mode)"
+  print -n "internet:   "; internet_ok "$iface" && print yes || print no
+  print -n "tailscale:  "; direct_ok "$iface" && print "reachable directly -> normal" || print "blocked -> campus"
+  print -n "WARP proxy: "; proxy_ok && print "working" || print "not working"
+  print "WARP:       $(warp status | head -1)$(warp_manual && print '  (manual full tunnel -> service stays out of the way)')"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- main loop
+[[ $EUID -eq 0 ]] || { print "campusd must run as root (use 'campusd probe' to test)"; exit 1; }
+mkdir -p "$RUN"
+cleanup() { log "campusd stopping; restoring normal mode"; apply_normal; state=stopped; set_state stopped "Service stopped"; exit 0 }
+trap cleanup TERM INT
+
+log "campusd starting (pid $$)"
+last_key=""; next_eval=0
+while true; do
+  read iface gw <<< "$(default_route)"
+  key="$iface|$gw|$(read_mode)|$(stat -f %m "$TRIGGER_FILE" 2>/dev/null)"
+  now=$(date +%s)
+  if [[ $key != $last_key ]] || (( now >= next_eval )); then
+    if [[ -n $last_key && $key != $last_key ]]; then
+      log "change detected: $last_key -> $key"
+      sleep 3   # let a new network settle
+      read iface gw <<< "$(default_route)"
+      key="$iface|$gw|$(read_mode)|$(stat -f %m "$TRIGGER_FILE" 2>/dev/null)"
+    fi
+    last_key=$key
+    evaluate
+    next_eval=$(( $(date +%s) + EVAL_INTERVAL ))
+  fi
+  sleep 5 & wait $!
+done

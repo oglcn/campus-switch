@@ -1,0 +1,12 @@
+# CampusSwitch settings (zsh syntax).
+# Copy to `config` before running install.sh; it is installed to
+# /Library/Application Support/CampusSwitch/config (root-owned).
+
+# Extra hosts that skip the WARP proxy in campus mode. Add your homelab
+# domain here so it goes over Tailscale instead of WARP, and your
+# university's own sites so they still see a campus IP.
+EXTRA_BYPASS=( '*.home.example.com' '*.example.edu' )
+
+# A machine on your tailnet that the menu bar app pings every 30 seconds
+# to show whether the tailnet works. Leave empty to hide the check.
+PEER=my-server
