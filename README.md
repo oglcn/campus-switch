@@ -57,7 +57,16 @@ To change it later, run `./configure.sh` (or edit `config` by hand), then `sudo 
 4. Otherwise: **campus mode**. WARP goes to proxy mode on `127.0.0.1:40000`, `tailscaled` starts with `HTTPS_PROXY` set and accepts subnet routes, and the macOS web proxy is turned on.
 5. If WARP can't connect: back to normal mode, retrying every 5 minutes.
 
-The menu bar app shows the state and lets you force a mode. It quits the Tailscale Mac app in campus mode and reopens it when you leave. Logs: `/Library/Logs/CampusSwitch.log` (the service) and `/Library/Logs/CampusSwitch-tailscaled.log`.
+### Menu bar
+
+- **Status:** the current mode, why it was chosen, and a ping to your `PEER` every 30 seconds.
+- **Mode:** Automatic, Always campus mode, or Always normal.
+- **Retry now:** re-check immediately, skipping the 5-minute wait after a WARP failure.
+- **Restart service…:** shown when the service isn't responding; asks for your admin password.
+- **More ▸ Turn off switching:** back to normal mode, and the service stays idle until you choose **Turn on**. Survives reboots.
+- **More ▸ Quit CampusSwitch:** turns switching off and removes the icon. Open CampusSwitch again and choose **Turn on** to resume.
+
+It quits the Tailscale Mac app in campus mode and reopens it when you leave (you can turn this off under More). Logs: `/Library/Logs/CampusSwitch.log` (the service) and `/Library/Logs/CampusSwitch-tailscaled.log`.
 
 To check what it would decide without changing anything:
 

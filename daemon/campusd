@@ -19,8 +19,8 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin
 
 BASE="/Library/Application Support/CampusSwitch"
 RUN="$BASE/run"
-MODE_FILE="$RUN/mode"          # auto | campus | normal   (written by the menu bar app)
-TRIGGER_FILE="$RUN/trigger"    # touched by the menu bar app for "Check now"
+MODE_FILE="$RUN/mode"          # auto | campus | normal | off   (written by the menu bar app)
+TRIGGER_FILE="$RUN/trigger"    # touched by the menu bar app for "Retry now"
 STATE_FILE="$RUN/state.json"   # read by the menu bar app
 PROXY_SVCS="$RUN/proxy_services"
 WARP_MANAGED="$RUN/warp_managed"
@@ -157,7 +157,7 @@ set_state() {  # state reason
 
 read_mode() {
   local m; m=$(head -c 16 "$MODE_FILE" 2>/dev/null | tr -dc 'a-z')
-  case $m in auto|campus|normal) print $m ;; *) print auto ;; esac
+  case $m in auto|campus|normal|off) print $m ;; *) print auto ;; esac
 }
 
 offline_count=0; health_fail=0; campus_backoff_until=0
@@ -194,6 +194,14 @@ want_campus() {  # reason
 evaluate() {
   mode=$(read_mode)
   svc=$(service_for_iface "$iface")
+
+  # Turned off from the menu bar: back to normal, then do nothing.
+  if [[ $mode == off ]]; then
+    [[ $state == off ]] || apply_normal
+    set_state off "Turned off from the menu bar"
+    return
+  fi
+
   if [[ -z $iface ]]; then set_state offline "No network"; return; fi
 
   case $mode in
@@ -243,9 +251,16 @@ trap cleanup TERM INT
 
 log "campusd starting (pid $$)"
 last_key=""; next_eval=0
+last_trigger=$(stat -f %m "$TRIGGER_FILE" 2>/dev/null)
 while true; do
   read iface gw <<< "$(default_route)"
-  key="$iface|$gw|$(read_mode)|$(stat -f %m "$TRIGGER_FILE" 2>/dev/null)"
+  trigger=$(stat -f %m "$TRIGGER_FILE" 2>/dev/null)
+  if [[ $trigger != $last_trigger ]]; then
+    # "Retry now": skip the WARP back-off and start the health count afresh.
+    log "retry requested from the menu bar"
+    last_trigger=$trigger; campus_backoff_until=0; health_fail=0
+  fi
+  key="$iface|$gw|$(read_mode)|$trigger"
   now=$(date +%s)
   if [[ $key != $last_key ]] || (( now >= next_eval )); then
     if [[ -n $last_key && $key != $last_key ]]; then

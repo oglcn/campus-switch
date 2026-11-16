@@ -92,10 +92,42 @@ final class Model: ObservableObject {
         if to == "campus" {
             NSRunningApplication.runningApplications(withBundleIdentifier: tailscaleAppID)
                 .forEach { $0.terminate() }
-        } else if previous == "campus", ["normal", "warp_manual", "stopped"].contains(to) {
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: tailscaleAppID) {
-                NSWorkspace.shared.openApplication(at: url, configuration: .init())
-            }
+        } else if previous == "campus", ["normal", "warp_manual", "stopped", "off"].contains(to) {
+            openTailscaleApp()
+        }
+    }
+
+    private func openTailscaleApp() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: tailscaleAppID) {
+            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+        }
+    }
+
+    var isOff: Bool { mode == "off" }
+    var serviceDown: Bool { st == nil || stale || st?.state == "stopped" }
+
+    func turnOff() { setMode("off") }
+    func turnOn() { setMode("auto"); retryNow() }
+
+    // Turn switching off, then leave. The service restores normal mode within a
+    // few seconds; reopen the Tailscale app here since we won't see that happen.
+    func quitAll() {
+        let wasCampus = st?.state == "campus"
+        setMode("off")
+        if wasCampus && manageTailscaleApp { openTailscaleApp() }
+        lastDaemonState = "off"
+        NSApp.terminate(nil)
+    }
+
+    func restartService() {
+        let cmd = "launchctl kickstart -k system/com.campusswitch.daemon || " +
+                  "launchctl bootstrap system /Library/LaunchDaemons/com.campusswitch.daemon.plist"
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")?
+            .executeAndReturnError(&err)
+        if let err, (err[NSAppleScript.errorNumber] as? Int) != -128 {   // -128: you pressed Cancel
+            alert("Couldn't restart the service",
+                  "\(err[NSAppleScript.errorMessage] ?? "Unknown error")\n\nTry: sudo ./install.sh")
         }
     }
 
@@ -104,8 +136,10 @@ final class Model: ObservableObject {
         catch { alert("Couldn't change mode", "\(error.localizedDescription)\n\nIs CampusSwitch installed? Run install.sh with sudo.") }
     }
 
-    func checkNow() {
+    // Re-check now and skip any WARP back-off; re-ping the peer once it settles.
+    func retryNow() {
         try? "\(Date().timeIntervalSince1970)\n".write(toFile: triggerFile, atomically: false, encoding: .utf8)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in self?.pingPeer() }
     }
 
     private var pinging = false
@@ -160,6 +194,7 @@ final class Model: ObservableObject {
     // Presentation
     var icon: String {
         guard let s = st, !stale else { return "questionmark.circle" }
+        if isOff { return "power.circle" }
         switch s.state {
         case "campus": return "graduationcap.fill"
         case "normal": return "network"
@@ -172,6 +207,7 @@ final class Model: ObservableObject {
     var title: String {
         guard let s = st else { return "Service not running (run install.sh)" }
         if stale { return "Service not responding" }
+        if isOff { return "CampusSwitch is off" }
         switch s.state {
         case "campus": return "Campus mode: Tailscale via WARP"
         case "normal": return "Normal: Tailscale app"
@@ -200,14 +236,20 @@ struct MenuContent: View {
             Text("\(s.service.isEmpty ? s.iface : s.service) · tailscaled \(s.tailscaled ? "running" : "stopped")")
         }
         Divider()
-        Picker("Mode", selection: Binding(get: { model.mode }, set: { model.setMode($0) })) {
-            Text("Automatic").tag("auto")
-            Text("Always campus mode").tag("campus")
-            Text("Always normal").tag("normal")
+        if model.serviceDown {
+            Button("Restart service…") { model.restartService() }
+        } else if model.isOff {
+            Button("Turn on") { model.turnOn() }
+        } else {
+            Picker("Mode", selection: Binding(get: { model.mode }, set: { model.setMode($0) })) {
+                Text("Automatic").tag("auto")
+                Text("Always campus mode").tag("campus")
+                Text("Always normal").tag("normal")
+            }
+            Button("Retry now") { model.retryNow() }
         }
-        Button("Check now") { model.checkNow() }
-        Divider()
-        if !model.peer.isEmpty {
+        if !model.peer.isEmpty && !model.isOff {
+            Divider()
             Text(model.peerResult.isEmpty ? "\(model.peer): checking…" : model.peerResult)
         }
         Divider()
@@ -217,7 +259,8 @@ struct MenuContent: View {
                 get: { model.manageTailscaleApp }, set: { model.manageTailscaleApp = $0 }))
             Button("Open log") { model.openLog() }
             Divider()
-            Button("Quit menu bar icon (service keeps running)") { NSApp.terminate(nil) }
+            if !model.isOff { Button("Turn off switching") { model.turnOff() } }
+            Button("Quit CampusSwitch") { model.quitAll() }
         }
     }
 }
