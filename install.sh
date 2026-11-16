@@ -24,6 +24,7 @@ sudo -u "$USER_NAME" ./build.sh
 echo "==> Stopping any previous install"
 launchctl bootout "system/$DAEMON" 2>/dev/null || true
 launchctl bootout "gui/$USER_ID/$AGENT" 2>/dev/null || true
+pkill -x CampusSwitch 2>/dev/null || true   # also a copy opened by hand
 # bootout returns before the old service has finished its cleanup; wait for it.
 for i in {1..40}; do
   launchctl print "system/$DAEMON" >/dev/null 2>&1 || launchctl print "gui/$USER_ID/$AGENT" >/dev/null 2>&1 || break
