@@ -21,7 +21,7 @@ The Tailscale Mac app deliberately sends its own traffic around other VPN tunnel
 ## Install
 
 ```bash
-git clone https://github.com/<you>/campus-switch.git
+git clone https://github.com/oglcn/campus-switch.git
 cd campus-switch
 cp config.example config    # then edit it, see below
 sudo ./install.sh
