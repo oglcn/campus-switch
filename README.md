@@ -80,6 +80,7 @@ zsh daemon/campusd probe
 - Apps that ignore the macOS proxy (some games, CLI tools) go out directly in campus mode.
 - In campus mode every connection goes through a relay (DERP) over WARP, so expect relay latency.
 - If the network also blocks WARP, campus mode can't work. The menu shows a warning and you stay on plain Wi-Fi.
+- If the Tailscale app's **VPN On Demand** is on, macOS restarts the app's tunnel on blocked networks too, which also brings the app back. Add the blocked network's Wi-Fi name (e.g. `eduroam`) to its exceptions in Tailscale ▸ Settings ▸ VPN On Demand.
 - Check your network's acceptable use policy before using this.
 
 ## Uninstall

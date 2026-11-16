@@ -85,14 +85,23 @@ final class Model: ObservableObject {
         set { defaults.set(newValue, forKey: "lastDaemonState") }
     }
 
+    // Set only when we quit the Tailscale app ourselves, so we never reopen an
+    // app you closed. Also survives restarts of this menu bar app.
+    private var weQuitTailscale: Bool {
+        get { defaults.bool(forKey: "weQuitTailscale") }
+        set { defaults.set(newValue, forKey: "weQuitTailscale") }
+    }
+
     private func transition(from: String?, to: String) {
         let previous = from ?? lastDaemonState
         if to != "offline" { lastDaemonState = to }   // offline is a blip, not a mode
         guard manageTailscaleApp else { return }
         if to == "campus" {
-            NSRunningApplication.runningApplications(withBundleIdentifier: tailscaleAppID)
-                .forEach { $0.terminate() }
-        } else if previous == "campus", ["normal", "warp_manual", "stopped", "off"].contains(to) {
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: tailscaleAppID)
+            if !apps.isEmpty { weQuitTailscale = true; apps.forEach { $0.terminate() } }
+        } else if previous == "campus", weQuitTailscale,
+                  ["normal", "warp_manual", "stopped", "off"].contains(to) {
+            weQuitTailscale = false
             openTailscaleApp()
         }
     }
@@ -114,7 +123,7 @@ final class Model: ObservableObject {
     func quitAll() {
         let wasCampus = st?.state == "campus"
         setMode("off")
-        if wasCampus && manageTailscaleApp { openTailscaleApp() }
+        if wasCampus && manageTailscaleApp && weQuitTailscale { weQuitTailscale = false; openTailscaleApp() }
         lastDaemonState = "off"
         NSApp.terminate(nil)
     }
